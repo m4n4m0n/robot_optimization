@@ -11,6 +11,7 @@ Benoetigt Python 3.10 oder aelter:  pip install evogym --upgrade
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import time
 from dataclasses import dataclass, asdict
@@ -94,6 +95,7 @@ class Config:
     sigma: float = 0.12       # Mutationsstaerke, relativ zur Bandbreite
     seed: int = 0
     eval_seed: int = 12345    # fest -> alle Individuen sehen dieselbe Startbedingung
+    workers: int = 1          # Prozesse fuer die Evaluation (1 = seriell)
 
 
 _ENV_CACHE = {}
@@ -146,6 +148,23 @@ def robot_points(env):
     return np.asarray(pos).T.round(4).tolist()
 
 
+def _eval_worker(args):
+    """Modulebene-Wrapper, damit Pool.map ihn picklen kann."""
+    genome, cfg = args
+    return evaluate(genome, cfg)
+
+
+def eval_batch(genomes, cfg, pool=None):
+    """Bewertet eine Liste von Genomen -- parallel, aber ergebnistreu zur Reihenfolge.
+
+    Pool.map behaelt die Eingabereihenfolge bei, deshalb bleibt der Lauf
+    bei gleichem Seed exakt reproduzierbar, egal wie viele Prozesse laufen.
+    """
+    if pool is None:
+        return [evaluate(g, cfg) for g in genomes]
+    return list(pool.map(_eval_worker, [(g, cfg) for g in genomes]))
+
+
 # ---------------------------------------------------------------------------
 # 4. (mu + lambda)-ES
 # ---------------------------------------------------------------------------
@@ -176,11 +195,17 @@ def run_evolution(cfg: Config, outdir: str):
     log = open(os.path.join(outdir, "lineage.jsonl"), "a")
     next_id = 0
 
+    # Prozesspool einmal anlegen -- jeder Worker baut sein eigenes Env beim
+    # ersten Task und haelt es danach im Cache.
+    pool = None
+    if cfg.workers > 1:
+        pool = mp.get_context("spawn").Pool(cfg.workers)
+        print(f"Evaluation auf {cfg.workers} Prozessen")
+
     # Startpopulation
+    init = [random_genome(n_act, rng) for _ in range(cfg.mu)]
     population = []  # Liste von (genome, fitness, id)
-    for _ in range(cfg.mu):
-        g = random_genome(n_act, rng)
-        fit = evaluate(g, cfg)
+    for g, fit in zip(init, eval_batch(init, cfg, pool)):
         log.write(json.dumps({"id": next_id, "parent": None, "gen": 0,
                               "fitness": fit, "genome": g.tolist()}) + "\n")
         population.append((g, fit, next_id))
@@ -189,11 +214,18 @@ def run_evolution(cfg: Config, outdir: str):
     history = []
     for gen in range(1, cfg.generations + 1):
         t0 = time.time()
-        offspring = []
+        # Erst alle Nachkommen erzeugen (seriell, damit der RNG-Strom
+        # unabhaengig von der Worker-Zahl bleibt), dann gebuendelt bewerten.
+        children, parents = [], []
         for _ in range(cfg.lam):
             pg, _pf, pid = population[rng.integers(len(population))]
-            child = mutate(pg, cfg, rng)
-            fit = evaluate(child, cfg)
+            children.append(mutate(pg, cfg, rng))
+            parents.append(pid)
+
+        fitnesses = eval_batch(children, cfg, pool)
+
+        offspring = []
+        for child, pid, fit in zip(children, parents, fitnesses):
             log.write(json.dumps({"id": next_id, "parent": pid, "gen": gen,
                                   "fitness": fit, "genome": child.tolist()}) + "\n")
             offspring.append((child, fit, next_id))
@@ -215,6 +247,9 @@ def run_evolution(cfg: Config, outdir: str):
         with open(os.path.join(outdir, "history.json"), "w") as f:
             json.dump(history, f, indent=2)
 
+    if pool is not None:
+        pool.close()
+        pool.join()
     np.save(os.path.join(outdir, "best.npy"), population[0][0])
     log.close()
     print(f"\nFertig. Bestes Individuum: {population[0][1]:.3f} -> {outdir}/best.npy")
@@ -232,9 +267,24 @@ def main():
     p.add_argument("--generations", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", type=str, default=None)
+    p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1),
+                   help="Prozesse fuer die Evaluation (1 = seriell)")
+    p.add_argument("--benchmark", action="store_true",
+                   help="Eine Evaluation messen und beenden")
     args = p.parse_args()
 
-    cfg = Config(generations=args.generations, seed=args.seed)
+    cfg = Config(generations=args.generations, seed=args.seed, workers=args.workers)
+
+    if args.benchmark:
+        n_act = n_actuators(BODY)
+        g = random_genome(n_act, np.random.default_rng(0))
+        evaluate(g, cfg)                      # Env-Aufbau nicht mitmessen
+        t0 = time.time(); evaluate(g, cfg); dt = time.time() - t0
+        total = cfg.generations * cfg.lam + cfg.mu
+        print(f"{dt*1000:.0f} ms pro Evaluation ({cfg.steps} Schritte)")
+        print(f"-> voller Lauf seriell: {total*dt/60:.1f} min, "
+              f"auf {cfg.workers} Kernen ~{total*dt/60/cfg.workers:.1f} min")
+        return
 
     if args.replay:
         genome = np.load(args.replay)
