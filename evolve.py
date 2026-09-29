@@ -7,6 +7,7 @@ Nutzung:
     python evolve.py --resume runs/xy     # Lauf fortsetzen
 
 Benoetigt Python 3.10 oder aelter:  pip install evogym --upgrade
+test
 """
 
 import argparse
