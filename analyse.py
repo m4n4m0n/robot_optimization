@@ -1,7 +1,5 @@
 """
-Meilenstein 4: Auswertung eines Laufs.
-
-    python analyze.py runs/20260101-120000
+Analyse des letzten evolve lauf.
 
 Erzeugt im Lauf-Ordner:  fitness.png, gait.png, lineage.png
 und schreibt Diagnosen auf die Konsole.
